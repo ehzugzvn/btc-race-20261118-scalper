@@ -23,16 +23,21 @@ DIP_BPS = 35
 MEDIAN_WINDOW = 30
 HISTORY = 45
 EMA_SPAN = 240
-KNIFE_BPS = 150
+KNIFE_BPS = 40
 TAKE_PROFIT_BPS = 60
 STOP_LOSS_BPS = 50
 MAX_HOLD_BARS = 90
 COOLDOWN_BARS = 5
+# A median touch alone does not cover the ~37 bps round-trip cost on this
+# pool, so the reversion exit also requires this much gain versus the
+# entry fill price before it may fire (take-profit/stop/timeout unchanged).
+MEDIAN_EXIT_MIN_GAIN_BPS = 50
 
 _closes = []
 _ema = None
 _ema_warm = []
 _entry_seq = None
+_entry_price = None
 _last_sell_seq = None
 _was_holding = False
 
@@ -55,7 +60,7 @@ def _current_median():
 
 
 def on_batch(state, batch):
-    global _entry_seq, _was_holding, _last_sell_seq
+    global _entry_seq, _entry_price, _was_holding, _last_sell_seq
     fresh = None
     for bar in batch["bars"]:
         if bar["symbol"] == SYMBOL:
@@ -74,8 +79,12 @@ def on_batch(state, batch):
     holding = held is not None and held.qty > 0
     if holding and not _was_holding:
         _entry_seq = state.seq
+        # Fills land at this bar's open, so its open is the entry price
+        # that gain is measured from.
+        _entry_price = int(fresh["o"])
     if not holding:
         _entry_seq = None
+        _entry_price = None
     _was_holding = holding
 
     med = _current_median()
@@ -100,15 +109,14 @@ def on_batch(state, batch):
         return []
 
     # Holding: exit on completed reversion, take-profit, hard stop, or timeout.
-    value = state.value(SYMBOL, held.qty)
     gain_bps = 0.0
-    if held.cost > 0:
-        gain_bps = (value - held.cost) * 10000.0 / held.cost
+    if _entry_price:
+        gain_bps = (close - _entry_price) * 10000.0 / _entry_price
     held_bars = 0
     if _entry_seq is not None:
         held_bars = state.seq - _entry_seq
     should_sell = (
-        close >= med
+        (close >= med and gain_bps >= MEDIAN_EXIT_MIN_GAIN_BPS)
         or gain_bps >= TAKE_PROFIT_BPS
         or gain_bps <= -STOP_LOSS_BPS
         or held_bars >= MAX_HOLD_BARS
